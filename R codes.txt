@@ -1,0 +1,255 @@
+#!/usr/bin/env Rscript
+# analysis.R
+# Project: Emission comparisons (CO2 / CH4 / N2O)
+# Author: Bashar (adapted)
+# Purpose: Make analyses reproducible and repo-friendly (no absolute paths)
+
+# --- Setup -------------------------------------------------------------------
+# Use here::here() to make relative paths robust
+if (!requireNamespace("here", quietly = TRUE)) {
+  stop("Please install the package 'here' before running this script (install.packages('here'))")
+}
+library(here)
+
+# Recommended packages (do NOT install automatically - install once per machine)
+required_pkgs <- c(
+  "tidyverse", "readxl", "ggpubr", "patchwork",
+  "FSA", "agricolae", "car", "effectsize", "broom",
+  "onewaytests", "PMCMRplus", "multcompView", "relaimpo"
+)
+
+missing_pkgs <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  message("Missing packages detected: ", paste(missing_pkgs, collapse = ", "))
+  message("Please install them, for example: install.packages(", 
+          paste0("c('", paste(missing_pkgs, collapse = "', '"), "')"), ")")
+  # Optionally stop or continue. We'll stop so user installs packages first.
+  stop("Install missing packages and re-run the script.")
+}
+
+# Load packages (quietly)
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(ggpubr)
+  library(patchwork)
+  library(FSA)
+  library(agricolae)
+  library(car)
+  library(effectsize)
+  library(broom)
+  library(onewaytests)
+  library(PMCMRplus)
+  library(multcompView)
+  library(relaimpo)
+})
+
+# Create directories for outputs if they don't exist
+dir.create(here("results"), showWarnings = FALSE, recursive = TRUE)
+dir.create(here("data","processed"), showWarnings = FALSE, recursive = TRUE)
+
+# --- Helper functions -------------------------------------------------------
+safe_read_excel <- function(path) {
+  if (!file.exists(path)) stop("Data file not found: ", path)
+  read_excel(path)
+}
+
+# --- Section A: Boxplot (CO2) -----------------------------------------------
+# Input file: put 'CO2.xlsx' into data/raw/ or update the path below
+co2_path <- here("data","raw","CO2.xlsx")
+df_raw <- safe_read_excel(co2_path)
+
+# Tidy and compute average day+night per replicate per treatment/DoC
+df_long <- df_raw %>%
+  pivot_longer(cols = -Treatment, names_to = "DoC_Time", values_to = "Emission") %>%
+  separate(DoC_Time, into = c("DoC", "Time"), sep = " \\(") %>%
+  mutate(
+    DoC = str_remove(DoC, "DoC "),
+    Time = str_remove(Time, "-time\\)"),
+    DoC = factor(DoC, levels = c("30","60","90","120","150","180"))
+  ) %>%
+  group_by(Treatment) %>%
+  mutate(Replicate = row_number()) %>%
+  ungroup()
+
+df_avg <- df_long %>%
+  group_by(Treatment, Replicate, DoC) %>%
+  summarise(Avg_Emission = mean(Emission, na.rm = TRUE), .groups = "drop")
+
+# Kruskal-Wallis p-values per DoC
+kw_results <- df_avg %>%
+  group_by(DoC) %>%
+  summarise(p_value = kruskal.test(Avg_Emission ~ Treatment)$p.value) %>%
+  mutate(label_text = ifelse(p_value < 0.001, "p < 0.001", paste0("p = ", signif(p_value,3))))
+
+p_box <- ggplot(df_avg, aes(x = Treatment, y = Avg_Emission, fill = Treatment)) +
+  geom_boxplot(outlier.shape = NA, size = 0.8) +
+  geom_jitter(width = 0.2, size = 2.5, alpha = 0.7) +
+  facet_wrap(~ DoC, nrow = 2, ncol = 3, labeller = labeller(DoC = function(x) paste0("DoC ", x))) +
+  labs(x = NULL, y = expression("Average CO"[2]*" Emission (mg/m"^2*"/h)")) +
+  theme_minimal(base_size = 14) +
+  theme(strip.text = element_text(face = "bold")) +
+  geom_text(data = kw_results, aes(x = Inf, y = Inf, label = label_text), inherit.aes = FALSE,
+            hjust = 1.1, vjust = 1.5, size = 4, fontface = "italic")
+
+ggsave(filename = here("results","CO2_boxplot.png"), plot = p_box, width = 12, height = 8, dpi = 300)
+
+# --- Section B: Post-hoc tests (example: N2O) -------------------------------
+# Input file: put 'N2O analysis.xlsx' into data/raw/
+n2o_path <- here("data","raw","N2O analysis.xlsx")
+df_n2o <- safe_read_excel(n2o_path)
+
+# Compute averaged Day & Night for each DoC (assumes column names exact as in original)
+avg_n2o <- df_n2o %>%
+  mutate(
+    DoC30  = rowMeans(cbind(`DoC 30 (Day-time)`, `DoC 30 (Night-time)`), na.rm = TRUE),
+    DoC60  = rowMeans(cbind(`DoC 60 (Day-time)`, `DoC 60 (Night-time)`), na.rm = TRUE),
+    DoC90  = rowMeans(cbind(`DoC 90 (Day-time)`, `DoC 90 (Night-time)`), na.rm = TRUE),
+    DoC120 = rowMeans(cbind(`DoC 120 (Day-time)`, `DoC 120 (Night-time)`), na.rm = TRUE),
+    DoC150 = rowMeans(cbind(`DoC 150 (Day-time)`, `DoC 150 (Night-time)`), na.rm = TRUE),
+    DoC180 = rowMeans(cbind(`DoC 180 (Day-time)`, `DoC 180 (Night-time)`), na.rm = TRUE)
+  ) %>%
+  select(Treatment, DoC30, DoC60, DoC90, DoC120, DoC150, DoC180)
+
+df_long_n2o <- avg_n2o %>%
+  pivot_longer(cols = starts_with("DoC"), names_to = "DoC", values_to = "Value")
+
+# For each DoC run Dunn test and extract CLD letters
+posthoc_letters <- df_long_n2o %>%
+  group_by(DoC) %>%
+  do({
+    res <- tryCatch({
+      dunn <- dunnTest(Value ~ Treatment, data = ., method = "bh")$res
+      cld <- cldList(P.adj ~ Comparison, data = dunn, threshold = 0.05)
+      cld$DoC <- unique(.$DoC)
+      cld
+    }, error = function(e) {
+      tibble(Group=NA, Letter=NA, DoC=unique(.$DoC))
+    })
+    res
+  }) %>%
+  ungroup()
+
+summary_letters <- df_long_n2o %>%
+  group_by(DoC, Treatment) %>%
+  summarise(mean = mean(Value, na.rm = TRUE), sd = sd(Value, na.rm = TRUE), .groups = "drop") %>%
+  left_join(posthoc_letters, by = c("DoC", "Treatment" = "Group"))
+
+# Save summary
+write_csv(summary_letters, here("results","summary_posthoc_letters_N2O.csv"))
+
+# --- Section C: Time-series increase (CO2 day vs night lines) ----------------
+# Reuse df_long from earlier
+df_long2 <- df_long %>%
+  mutate(DoC = factor(DoC, levels = c("30","60","90","120","150","180")),
+         Time = factor(Time, levels = c("Day","Night"))) %>%
+  group_by(Treatment, Time) %>%
+  mutate(Replicate = row_number()) %>%
+  ungroup()
+
+p_lines <- ggplot(df_long2, aes(x = as.numeric(as.character(DoC)), y = Emission, 
+                                group = interaction(Replicate, Time), color = Time)) +
+  geom_line(alpha = 0.7) +
+  geom_point(size = 2) +
+  geom_smooth(aes(group = Time), method = "lm", se = FALSE, linetype = "dashed", size = 1) +
+  facet_wrap(~ Treatment) +
+  scale_x_continuous(breaks = c(30,60,90,120,150,180)) +
+  labs(x = "Day of Culture (DoC)", y = expression("CO"[2]*" Emission (mg/m"^2*"/h)"), color = "Time of Day") +
+  theme_minimal(base_size = 14) + theme(legend.position = "top")
+
+ggsave(here("results","CO2_lines_day_night.png"), p_lines, width = 12, height = 6, dpi = 300)
+
+# --- Section D: Interaction / Two-way ANOVA (example on N2O averaged data) ---
+# Prepare averaged data for ANOVA (from df_long_n2o but using original df_long approach)
+df_long_n2o2 <- df_n2o %>%
+  pivot_longer(cols = -Treatment, names_to = "DoC_Time", values_to = "Emission") %>%
+  separate(DoC_Time, into = c("DoC","Time"), sep = " \\(") %>%
+  mutate(DoC = str_remove(DoC, "DoC "), Time = str_remove(Time, "-time\\)")) %>%
+  group_by(Treatment, DoC) %>%
+  summarise(Avg_Emission = mean(Emission, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Treatment = as.factor(Treatment), DoC = factor(DoC, levels = c("30","60","90","120","150","180")))
+
+anova_model <- aov(Avg_Emission ~ Treatment * DoC, data = df_long_n2o2)
+type2_anova <- Anova(anova_model, type = 2)
+eta2 <- eta_squared(anova_model, partial = FALSE)
+anova_table <- tidy(anova_model) %>%
+  select(term, df, sumsq, meansq, statistic, p.value) %>%
+  mutate(eta_sq = eta2$Eta2[match(term, eta2$Parameter)]) %>%
+  rename(Term = term, Df = df, `Sum Sq` = sumsq, `Mean Sq` = meansq,
+         `F value` = statistic, `p-value` = p.value, `Eta Sq` = eta_sq)
+
+write_csv(anova_table, here("results","N2O_ANOVA_EtaSq_Table.csv"))
+
+# Plot interaction
+df_summary <- df_long_n2o2 %>%
+  group_by(Treatment, DoC) %>%
+  summarise(Mean_Emission = mean(Avg_Emission), SE = sd(Avg_Emission)/sqrt(n()), .groups = "drop")
+
+p_interaction <- ggplot(df_summary, aes(x = DoC, y = Mean_Emission, color = Treatment, group = Treatment)) +
+  geom_line(size = 1) + geom_point(size = 3) +
+  geom_errorbar(aes(ymin = Mean_Emission - SE, ymax = Mean_Emission + SE), width = 0.1) +
+  labs(x = "Days of Culture (DoC)", y = expression("N"[2]*"O emission ± SE (µg/m"^2*"/h)")) +
+  theme_minimal(base_size = 14) + theme(legend.position = "right")
+
+
+
+# --- Section E: Welch ANOVA + Games-Howell (FEFI example) --------------------
+# Example data (you may replace with reading a data file)
+data_example <- read.table(text = "
+Treatment\tFEFI\tRelative_FEFI\tNEFI
+BC\t1.045\t0.622\t0.522
+BC\t0.925\t0.452\t0.463
+BC\t0.906\t0.406\t0.453
+BCS\t0.949\t0.434\t0.475
+BCS\t0.925\t0.404\t0.462
+BCS\t0.839\t0.352\t0.420
+BCP\t0.754\t0.362\t0.377
+BCP\t0.804\t0.352\t0.402
+BCP\t0.970\t0.427\t0.485
+PO\t1.106\t0.535\t0.553
+PO\t1.292\t0.644\t0.646
+PO\t1.183\t0.519\t0.591
+IMTA\t0.639\t0.243\t0.320
+IMTA\t0.722\t0.283\t0.361
+IMTA\t0.790\t0.296\t0.395
+", header = TRUE, sep = "\t") %>% mutate(Treatment = factor(Treatment))
+
+run_welch_gameshowell <- function(df, var) {
+  welch_res <- welch.test(as.formula(paste(var, "~ Treatment")), data = df)
+  gh_res <- gamesHowellTest(as.formula(paste(var, "~ Treatment")), data = df)
+  pvals <- gh_res$p.value
+  letters <- multcompLetters(pvals)$Letters
+  groups_df <- data.frame(Treatment = names(letters), Letters = letters, row.names = NULL)
+  summary_stats <- df %>% group_by(Treatment) %>%
+    summarise(Mean = mean(.data[[var]], na.rm=TRUE), SD = sd(.data[[var]], na.rm=TRUE)) %>%
+    mutate(`Mean ± SD` = paste0(round(Mean,3), " ± ", round(SD,3))) %>%
+    left_join(groups_df, by = "Treatment") %>%
+    select(Treatment, `Mean ± SD`, Letters)
+  colnames(summary_stats)[2:3] <- paste0(var, c("_Mean±SD", "_Letters"))
+  list(welch = welch_res, gh = gh_res, summary = summary_stats)
+}
+
+fefi_res <- run_welch_gameshowell(data_example, "FEFI")
+write_csv(fefi_res$summary, here("results","FEFI_welch_gameshowell_summary.csv"))
+
+
+
+# --- Section F: Relative importance -----------------------------------------
+# Example data for relaimpo
+df_relaimpo <- data.frame(
+  CO2e = c(Quantitative data for all sampling occeassion),
+  Prawn = c(Quantitative data for all sampling occeassion),
+  Carp = c(Quantitative data for all sampling occeassion),
+  Snail = c(Quantitative data for all sampling occeassion),
+  Plant = c(Quantitative data for all sampling occeassion)
+)
+
+
+model <- lm(CO2e ~ Prawn + Carp + Snail + Plant, data = df_relaimpo)
+importance <- calc.relimp(model, type = "lmg", rela = TRUE)
+# Save importance table
+importance_df <- data.frame(Variable = names(importance$lmg), LMG = as.numeric(importance$lmg))
+write_csv(importance_df, here("results","relative_importance.csv"))
+
+
+message("Analysis complete. Results are in: ", here("results"))
